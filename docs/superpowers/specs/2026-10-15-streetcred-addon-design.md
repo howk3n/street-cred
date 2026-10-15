@@ -1,7 +1,7 @@
 # StreetCred — v1 Design
 
 **Date:** 2026-10-15
-**Status:** Approved in brainstorming, pending written-spec review
+**Status:** Approved in brainstorming, revised after the grill-me review, pending written-spec review
 
 ## 1. Purpose
 
@@ -58,12 +58,17 @@ The design is defensive about each of these, and all of them live in the adapter
 | Rating content | 👍 = no extra input. 👎 = **at least one reason checkbox required**. **No free text anywhere** | Ratings stay tiny; no comments to moderate |
 | Negative reasons | ninja looting · left mid-run · kicked without reason · no-show/AFK · trade scam · deliberate griefing | Reliability only. Toxic behavior is deliberately excluded |
 | Reason weighting | All negative reasons count equally | Simple and predictable |
+| Group aggregation | **One group = one vote**, decided by majority (a tie counts as 👎). Groups are identified by a roster fingerprint | Stops group ganging and premade boosting. Interim rule for v1; see §13 |
+| Changing ratings | Withdraw at any time. Change only while eligible (within 24 h of the last interaction). A new interaction allows a new rating that replaces the old one | Second thoughts are allowed; revenge flips aren't |
+| Language | English at release; every visible string goes through a locale table | Translations can be added later; synced data doesn't depend on language |
 | Rater anonymity | Raters' names are hidden in the UI. Ratings from your guildmates and friends are highlighted | Gives a trust signal without public naming. True anonymity is technically impossible, which the addon description says |
 | Rating trigger | `/streetcred` manually, plus an end-of-group prompt **only after real content** | Gets enough ratings coming in without spamming players |
-| Retention | Ratings expire **90 days** after their timestamp | Limits storage; old behavior stops counting |
-| Score display | **Colored tier word + raw percentage + count**, e.g. `Solid · 80% (5)` | The word is the quick check; the numbers help with borderline cases |
+| Retention | Ratings expire **90 days** after their timestamp. Hard cap of **300k stored ratings**, oldest dropped first | Keeps saved data under about 20 MB; old behavior stops counting |
+| Score display | **Colored tier word + raw percentage + counts**, e.g. `Solid · 80% (5 groups, 12 raters)` | The word is the quick check; the numbers help with borderline cases |
 
-**Out of scope for v1:** the mouseover tooltip line, a website/server/companion app, comments, positive tags, rating relays, cryptographic signatures, a waiting period for new raters, per-rater daily caps, and a toxic-behavior flag.
+**Out of scope for v1:** the mouseover tooltip line, a website/server/companion app, comments, positive tags, rating relays, cryptographic signatures, a waiting period for new raters, per-rater daily caps, a toxic-behavior flag, and translations.
+
+**Release policy:** the full v1 scope ships; the addon is released when it's done, not cut down to hit launch day. Implementation is ordered core-first (storage, scoring, sync), then UI and polish.
 
 ## 4. Architecture
 
@@ -120,6 +125,7 @@ spec/sim/                   fake adapter + multi-player simulator + scenario tes
 | reasons | bitmask | Only for `-1` and must be non-zero. Bits: 1 ninja, 2 left_mid_run, 4 kicked_no_reason, 8 no_show_afk, 16 trade_scam, 32 griefing |
 | context | `D`/`R`/`G`/`T` | dungeon, raid, open-world group, trade |
 | instanceId | integer or 0 | From `GetInstanceInfo`; 0 for G/T |
+| group | 8 hex chars | Group fingerprint: a hash of the sorted `PlayerId`s present the last time the target was in the rater's group (both names for a trade). Every member of a group computes the same value independently |
 | time | integer | Author's `GetServerTime()` |
 | seq | integer | The author's counter; goes up by 1 on every new or changed rating |
 
@@ -129,12 +135,18 @@ spec/sim/                   fake adapter + multi-player simulator + scenario tes
 StreetCredDB = {
   schema = 1,
   mySeq = 0,
-  ratings = { [author] = { [target] = rating } },
+  -- each rating is one compact string: "verdict;reasons;context;instanceId;group;time;seq"
+  ratings = { [target] = { [author] = "-1;1;D;389;a91c03f2;1760500000;43" } },
+  mine = { [target] = "..." },            -- my own ratings, used for BATCH replies
   authors = { [author] = { haveThrough = 0, lastSeen = 0 } },
-  interactions = { [playerId] = { time = 0, context = "D" } },
+  interactions = { [playerId] = { time = 0, context = "D", group = "a91c03f2" } },
+  firstSync = 0,                          -- server time of the first channel join (for the "Syncing…" state)
   settings = { groupPrompt = true, shareRatings = true },
 }
 ```
+
+- Ratings are decoded only when needed. Scores are cached per target and recomputed only when one of that target's ratings changes.
+- **Storage cap:** above 300k stored ratings, the ratings with the oldest `time` are dropped first.
 
 - **Expiry:** when the addon loads and on every merge, ratings with `time < now − 90 days` are removed.
 - **Withdrawn ratings** (verdict 0) are kept as markers until they expire, so `BATCH` replies carry withdrawals to clients that were offline. They're ignored by the score.
@@ -145,7 +157,14 @@ StreetCredDB = {
 
 ### Transport
 
-- Prefix `STRC`. Hidden channel `StreetCred`, joined with `JoinTemporaryChannel` and removed from all chat frames.
+- Prefix `STRC`.
+- **Channels (modelled on AutoLayer):** the static `StreetCred` plus **2 daily channels** named `SCred` + an 8-hex-digit hash of the server's UTC date in two formats (`yyyy-mm-dd`, `dd-mm-yyyy`). The hash is a small built-in Lua function (no LibDeflate).
+  - **Join them all at once**, so addon users are almost always the owners and an empty channel is never left for a griefer to claim.
+  - **Join tomorrow's channels early,** from 3 h before the UTC date changes.
+  - **Leave old channels** after the date changes. Our channels must not end up in the General/Trade slot numbers; if one does, leave it and rejoin 30 s later.
+  - **A channel that fails to join** (password-locked, banned) is marked failed for the rest of the day and skipped.
+  - **Hide** every joined channel from all chat frames.
+  - **Send to every channel that works; drop duplicates when receiving** (by author + seq, or by message ID for HELLO/WANT).
 - Every message: `1|TYPE|field;field;...` (`1` = protocol version). Unknown versions are dropped.
 - Payloads over 240 B are split: `1|C|msgId;idx;total|<part>`. Reassembly gives up after 30 s.
 - All sends go through the **SendQueue**: a token-bucket rate limit (starting at 800 B/s and 10 messages of burst; to be tuned) that **holds everything while `InChatMessagingLockdown()` is true** and releases on `ADDON_RESTRICTION_STATE_CHANGED` / `PLAYER_REGEN_ENABLED`.
@@ -154,8 +173,8 @@ StreetCredDB = {
 
 | Type | Fields | Sent |
 |---|---|---|
-| `RATE` | target; verdict; reasons; context; instanceId; time; seq | When the player submits, changes or withdraws a rating. Sent to the channel |
-| `HELLO` | seq (author's `mySeq`) | On login; every 60 ± 15 min after that; and to PARTY/RAID on `GROUP_ROSTER_UPDATE` (at most once per minute) |
+| `RATE` | target; verdict; reasons; context; instanceId; group; time; seq | When the player submits, changes or withdraws a rating. Sent to the channel |
+| `HELLO` | seq (author's `mySeq`) | On login; every 60 ± 15 min after that (**30 ± 10 min for the first 7 days after release**, set by a release-date constant); and to PARTY/RAID on `GROUP_ROSTER_UPDATE` (at most once per minute) |
 | `WANT` | author; fromSeq | When an author's `HELLO` seq is above our `haveThrough` |
 | `BATCH` | through; then one or more ratings | An author's reply to `WANT`s. Sent to the channel and split into chunks |
 
@@ -167,7 +186,8 @@ StreetCredDB = {
 4. **Request suppression:** before sending a `WANT`, wait a random 0–10 s. If in that time we see someone else's `WANT` for the same author with `fromSeq ≤` ours, don't send ours.
 5. **Author batching:** an author collects `WANT`s for 5 s and then broadcasts one `BATCH` containing all of its non-expired ratings with `seq ≥` the lowest requested `fromSeq`. The same range isn't re-broadcast within 60 s.
 6. **Sharing opt-out:** with `shareRatings = false`, the client sends no `RATE`, `HELLO` or `BATCH`, but still receives.
-7. **Backing off under load:** if more than 50 channel messages per second arrive over a 1-minute window, the `HELLO` interval doubles (up to 4 h). It returns to normal once the rate falls back.
+7. **Junk-sender muting:** a sender with more than 10 invalid messages within 10 min is ignored locally for 1 h.
+8. **Backing off under load:** if more than 50 channel messages per second arrive over a 1-minute window, the `HELLO` interval doubles (up to 4 h). It returns to normal once the rate falls back.
 
 ## 7. Eligibility and group sessions
 
@@ -175,39 +195,55 @@ StreetCredDB = {
   - While grouped, every member is recorded with `time = now` on each `GROUP_ROSTER_UPDATE` and every 60 s.
   - The trade partner is captured on `TRADE_SHOW` and recorded with context `T` when the trade completes.
   - Entries older than 24 h are pruned.
+- **Group fingerprint:** each interaction stores the fingerprint of the roster at that moment (the sorted member `PlayerId`s, including yourself and the target). The stored value is overwritten on every roster update while the target is present, so it ends up as "the roster the last time the target was here".
 - **Can rate X** = own level ≥ 10 **and** an interaction with X within 24 h **and** X isn't yourself.
+- **Can change a rating of X** = can rate X. **Can withdraw** = always. A new rating replaces your previous one for that target and takes the current interaction's fingerprint.
 - **Group session:** starts when a group forms or the player joins one, and ends on `GROUP_LEFT`. It counts as **real content** if the group was inside a party or raid instance together at any point, **or** the session lasted at least 15 minutes. If so, the prompt appears once the player is out of combat. It lists every member who was present during the session.
 
 ## 8. Score
 
-For a target, take every stored, non-expired rating with verdict ±1. With `pos` 👍 and `n` ratings in total:
+For a target, take every stored, non-expired rating with verdict ±1 and **group them by fingerprint into votes**:
 
-- `n < 5` → **Unknown** (gray, no percentage).
-- Otherwise `score = (pos + 9) / (n + 10)` (a Bayesian average: every player starts with 9 imaginary 👍 and 1 imaginary 👎).
+- **Each group is one vote:** 👍 if most of that group's ratings are 👍, otherwise 👎 (a **tie counts as 👎**). Each trade fingerprint is its own vote.
+- With `pos` 👍 votes and `n` votes in total:
+  - `n < 5` → **Unknown** (gray, no percentage). Within 75 min of `firstSync`, or of a login after more than 7 days away, **Syncing…** is shown instead of Unknown.
+  - Otherwise `score = (pos + 9) / (n + 10)` (a Bayesian average: every player starts with 9 imaginary 👍 and 1 imaginary 👎).
 - **Trusted** ≥ 0.90 (green) · **Solid** ≥ 0.82 (light green) · **Mixed** ≥ 0.77 (yellow) · **Risky** < 0.77 (red).
-- Display: `Tier · round(100·pos/n)% (n)`.
+- Display: `Tier · round(100·pos/n)% (n groups, m raters)`, where `m` is the number of individual ratings.
+- Combining ratings into votes is a single function in `score.lua` (`aggregateVotes`), so the interim rule can be replaced later (§13) without touching storage, sync or the UI.
 
-Reference cases (these are also unit tests):
+Reference cases (in votes; these are also unit tests):
 
-| Ratings | Shown | Score | Tier |
+| Votes | Shown | Score | Tier |
 |---|---|---|---|
-| 4👍 1👎 | 80% (5) | 0.867 | Solid |
-| 75👍 25👎 | 75% (100) | 0.764 | Risky |
-| 5👍 0👎 | 100% (5) | 0.933 | Trusted |
-| 2👍 3👎 | 40% (5) | 0.733 | Risky |
-| 8👍 2👎 | 80% (10) | 0.850 | Solid |
-| 40👍 10👎 | 80% (50) | 0.817 | Mixed |
-| 20👍 2👎 | 91% (22) | 0.906 | Trusted |
-| 3👍 1👎 | 75% (4) | — | Unknown |
+| 4👍 1👎 | 80% (5 groups) | 0.867 | Solid |
+| 75👍 25👎 | 75% (100 groups) | 0.764 | Risky |
+| 5👍 0👎 | 100% (5 groups) | 0.933 | Trusted |
+| 2👍 3👎 | 40% (5 groups) | 0.733 | Risky |
+| 8👍 2👎 | 80% (10 groups) | 0.850 | Solid |
+| 40👍 10👎 | 80% (50 groups) | 0.817 | Mixed |
+| 20👍 2👎 | 91% (22 groups) | 0.906 | Trusted |
+| 3👍 1👎 | 75% (4 groups) | — | Unknown |
+
+Vote-combining cases (also unit tests):
+
+| Ratings | Votes |
+|---|---|
+| 4 raters in one group, all 👎 | 1👎 |
+| One group: 3👍 1👎 | 1👍 |
+| One group: 2👍 2👎 | 1👎 (tie) |
+| 4 raters in one premade, all 👍, no other ratings | 1👍, so still Unknown |
 
 The thresholds are constants in `score.lua`, to be tuned after launch.
 
 ## 9. UI
 
-- **`/streetcred`** (current target) or **`/streetcred Primary Secondary`**:
+- **All visible text** goes through a locale table (`L["..."]`); English only in v1. Tier colors are the same in every language.
+- **`/streetcred`** or **`/scred`** (current target), or with a name (`/scred Primary Secondary`):
   - The popup shows the name, colored tier word, percentage and count, 👍/👎 totals, a breakdown of negative reasons (`Ninja looting ×1`), "★ N guildmates/friends rated 👍/👎", "Data from N raters", and your own rating.
   - If you can rate: **[👍] [👎]**. 👎 expands the reason checkboxes and needs **[Submit]**; nothing is saved without an explicit Submit.
   - If you've already rated: **[Change] [Withdraw]**.
+  - Once the rating window has passed, only **[Withdraw]** remains.
   - Opening it on yourself shows your own score without rating buttons.
 - **`/streetcred debug`** prints sync counters (messages in/out, dropped by reason, queue depth, authors known).
 - **End-of-group prompt:**
@@ -226,7 +262,7 @@ The thresholds are constants in `score.lua`, to be tuned after launch.
 
 ## 11. Testing
 
-- **Unit (busted, Lua 5.1):** codec round-trips and chunking at the 255 B limit; score reference table; eligibility (level, 24 h window, self); merge and `haveThrough` rules; expiry; request suppression timing; schema migration and backup.
+- **Unit (busted, Lua 5.1):** codec round-trips and chunking at the 255 B limit; score and vote-combining reference tables; group fingerprints (the same roster gives the same hash regardless of order); daily channel names; eligibility (level, 24 h window, self, change vs. withdraw); merge and `haveThrough` rules; expiry and the 300k cap; request suppression timing; junk-sender muting; schema migration and backup.
 - **Simulation:** the fake adapter runs N virtual players with a shared channel, sender stamping, the 255 B drop rule, lockdown toggling and login/logout. Required scenarios:
   1. A rates B while C is offline; C logs in later and catches up through HELLO/WANT/BATCH.
   2. A forged `RATE` whose fields claim to come from A but is sent by D is attributed to D, not A.
@@ -234,6 +270,8 @@ The thresholds are constants in `score.lua`, to be tuned after launch.
   4. A rating sent during lockdown goes out after lockdown ends.
   5. A changed rating replaces the old one everywhere, and withdrawing removes it from the score.
   6. A group session with an instance entry produces the prompt; a 5-minute questing group doesn't.
+  7. Clients split across different working channels (one channel locked) still receive every rating exactly once.
+  8. Four group members who all rate the same target 👎 produce one 👎 vote on every client.
 - **In-game smoke test (beta):** load the addon with no errors, check `/streetcred` on a target, and check that a rating made on one character reaches a second character over the channel.
 - **CI:** GitHub Actions runs `busted` and `luacheck` on every push.
 
@@ -242,3 +280,9 @@ The thresholds are constants in `score.lua`, to be tuned after launch.
 Published on CurseForge (and Wago) using the BigWigs packager GitHub Action, with `## Interface: 16001`. The addon description explains the reliability-only purpose, that rater names are hidden in the UI but not truly anonymous, and the 90-day retention.
 
 The throwaway `SCProbe` addon is removed from the beta install before release work starts.
+
+## 13. Future brainstorming topics (not in v1)
+
+- **Corroboration:** several matching ratings from one group shouldn't count as several votes, but they should make that group's vote more *credible*, relative to how many members of that group had the addon.
+- **Split groups:** what it means when 2 members of a group call a player unreliable and 2 call them reliable, and whether a tie should really count as 👎.
+- **Server-backed v2:** an optional website or companion app if StreetCred takes off, closing the gap where determined abusers prepare alts in advance with a modified addon.
