@@ -1,0 +1,19 @@
+# Claude Code local settings
+.claude/settings.local.json
+
+# Superpowers scratch state
+.superpowers/
+
+# Lua tooling
+luacov.*.out
+.luarocks/
+lua_modules/
+
+# Release packaging output
+.release/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
